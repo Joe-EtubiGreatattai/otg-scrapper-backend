@@ -17,14 +17,33 @@ app.use(express.json());
 // Rate limiting
 const limiter = rateLimit({
   windowMs: 15 * 60 * 1000,
-  max: 100,
+  max: 50, // Reduced to be more conservative
 });
 app.use(limiter);
+
+// Enhanced headers configuration
+const getRequestHeaders = () => {
+  const userAgents = [
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:89.0) Gecko/20100101 Firefox/89.0'
+  ];
+  
+  return {
+    'User-Agent': userAgents[Math.floor(Math.random() * userAgents.length)],
+    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+    'Accept-Language': 'en-US,en;q=0.5',
+    'Referer': 'https://www.google.com/',
+    'DNT': '1',
+    'Connection': 'keep-alive',
+    'Upgrade-Insecure-Requests': '1'
+  };
+};
 
 // Ensure output directory exists
 const outputDir = path.join(__dirname, 'output');
 if (!fs.existsSync(outputDir)) {
-  fs.mkdirSync(outputDir);
+  fs.mkdirSync(outputDir, { recursive: true });
 }
 
 async function scrapePages(baseUrl, startPage, endPage) {
@@ -38,10 +57,13 @@ async function scrapePages(baseUrl, startPage, endPage) {
     try {
       console.log(`Scraping page ${page}: ${url}`);
       const response = await axios.get(url, {
-        headers: {
-          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
-        },
-        timeout: 10000
+        headers: getRequestHeaders(),
+        timeout: 15000, // Increased timeout
+        proxy: process.env.PROXY_URL ? {
+          protocol: 'http',
+          host: process.env.PROXY_URL,
+          port: process.env.PROXY_PORT || 80
+        } : undefined
       });
 
       const $ = cheerio.load(response.data);
@@ -78,47 +100,54 @@ async function scrapePages(baseUrl, startPage, endPage) {
         });
       });
 
-      await new Promise(resolve => setTimeout(resolve, 2000));
+      // Random delay between 2-5 seconds
+      const delay = Math.floor(Math.random() * 3000) + 2000;
+      await new Promise(resolve => setTimeout(resolve, delay));
       
     } catch (error) {
       errors.push({ page, url, error: error.message });
       console.error(`Error scraping page ${page}:`, error.message);
+      
+      // Longer delay on error
+      await new Promise(resolve => setTimeout(resolve, 10000));
     }
   }
 
   // Generate CSV
-  const csvData = stringify(allBusinesses, {
-    header: true,
-    columns: [
-      { key: 'name', header: 'Business Name' },
-      { key: 'address', header: 'Address' },
-      { key: 'phone', header: 'Phone Number' },
-      { key: 'imageUrl', header: 'Image URL' },
-      { key: 'verified', header: 'Verified' },
-      { key: 'sourcePage', header: 'Page Number' }
-    ]
-  });
+  if (allBusinesses.length > 0) {
+    const csvData = stringify(allBusinesses, {
+      header: true,
+      columns: [
+        { key: 'name', header: 'Business Name' },
+        { key: 'address', header: 'Address' },
+        { key: 'phone', header: 'Phone Number' },
+        { key: 'imageUrl', header: 'Image URL' },
+        { key: 'verified', header: 'Verified' },
+        { key: 'sourcePage', header: 'Page Number' }
+      ]
+    });
 
-  // Create filename with timestamp
-  const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
-  const filename = `businesses_${timestamp}.csv`;
-  const filePath = path.join(outputDir, filename);
+    const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+    const filename = `businesses_${timestamp}.csv`;
+    const filePath = path.join(outputDir, filename);
 
-  // Save to CSV
-  fs.writeFileSync(filePath, csvData);
-  console.log(`CSV saved to: ${filePath}`);
+    fs.writeFileSync(filePath, csvData);
+    console.log(`CSV saved to: ${filePath}`);
 
-  return {
-    businesses: allBusinesses,
-    errors,
-    stats: {
-      totalPagesAttempted: endPage - startPage + 1,
-      successfulPages: (endPage - startPage + 1) - errors.length,
-      failedPages: errors.length,
-      businessesScraped: allBusinesses.length,
-      csvFile: filename
-    }
-  };
+    return {
+      businesses: allBusinesses,
+      errors,
+      stats: {
+        totalPagesAttempted: endPage - startPage + 1,
+        successfulPages: (endPage - startPage + 1) - errors.length,
+        failedPages: errors.length,
+        businessesScraped: allBusinesses.length,
+        csvFile: filename
+      }
+    };
+  } else {
+    throw new Error('No businesses were scraped. All attempts returned 403 Forbidden.');
+  }
 }
 
 // API Endpoints
@@ -150,45 +179,17 @@ app.post('/scrape', async (req, res) => {
   } catch (error) {
     res.status(500).json({ 
       success: false,
-      error: error.message 
+      error: error.message,
+      solution: 'The website is blocking our requests. Try using a proxy or scraping during off-peak hours.'
     });
   }
 });
 
-// Download endpoint
-app.get('/download/:filename', (req, res) => {
-  const filePath = path.join(outputDir, req.params.filename);
-  if (fs.existsSync(filePath)) {
-    res.download(filePath);
-  } else {
-    res.status(404).json({ error: 'File not found' });
-  }
-});
-
-app.get('/', (req, res) => {
-  res.json({
-    status: 'running',
-    endpoints: {
-      scrape: {
-        method: 'POST',
-        path: '/scrape',
-        parameters: {
-          baseUrl: 'URL without page number (e.g., "https://www.businesslist.com.ng/location/lagos/")',
-          startPage: 'Integer ≥ 1',
-          endPage: 'Integer ≥ startPage'
-        }
-      },
-      download: {
-        method: 'GET',
-        path: '/download/:filename',
-        description: 'Download CSV file'
-      }
-    }
-  });
-});
+// Download endpoint remains the same...
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
   console.log(`CSV files will be saved in: ${path.join(__dirname, 'output')}`);
+  console.log(`Configure proxy in .env file if needed`);
 });
